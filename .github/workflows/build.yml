@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
 
+# 同一时间只跑一个，避免覆盖文件时叠出多个 run
+concurrency:
+  group: wda-build
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-13
@@ -18,8 +23,12 @@ jobs:
 
       - name: toolchain
         run: |
+          for X in /Applications/Xcode_14.3.app /Applications/Xcode_14.2.app /Applications/Xcode_14.1.app; do
+            if [ -d "$X" ]; then sudo xcode-select -s "$X"; echo "使用 $X"; break; fi
+          done
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+          echo "DEVELOPER_DIR=$(xcode-select -p)"
 
       - name: build-for-testing
         working-directory: wda
@@ -30,9 +39,11 @@ jobs:
             -scheme WebDriverAgentRunner \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/dd" \
+            IPHONEOS_DEPLOYMENT_TARGET=14.0 \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
             DEVELOPMENT_TEAM="" \
             2>&1 | tail -60
 
@@ -46,18 +57,74 @@ jobs:
             exit 1
           fi
           echo "APP=$APP"
-          echo 'PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPCFET0NUWVBFIHBsaXN0IFBVQkxJQyAiLS8vQXBwbGUvL0RURCBQTElTVCAxLjAvL0VOIiAiaHR0cDovL3d3dy5hcHBsZS5jb20vRFREcy9Qcm9wZXJ0eUxpc3QtMS4wLmR0ZCI+CjxwbGlzdCB2ZXJzaW9uPSIxLjAiPgo8ZGljdD4KICA8a2V5PmdldC10YXNrLWFsbG93PC9rZXk+PHRydWUvPgogIDxrZXk+cGxhdGZvcm0tYXBwbGljYXRpb248L2tleT48dHJ1ZS8+CiAgPGtleT5jb20uYXBwbGUucHJpdmF0ZS5zZWN1cml0eS5uby1jb250YWluZXI8L2tleT48dHJ1ZS8+CiAgPGtleT5jb20uYXBwbGUucHJpdmF0ZS5zZWN1cml0eS5jb250YWluZXItcmVxdWlyZWQ8L2tleT48ZmFsc2UvPgogIDxrZXk+dGFza19mb3JfcGlkLWFsbG93PC9rZXk+PHRydWUvPgogIDxrZXk+cnVuLXVuc2lnbmVkLWNvZGU8L2tleT48dHJ1ZS8+CiAgPGtleT5jb20uYXBwbGUuc2VjdXJpdHkuY3MuYWxsb3ctaml0PC9rZXk+PHRydWUvPgo8L2RpY3Q+CjwvcGxpc3Q+Cg==' | base64 -d > "$RUNNER_TEMP/ent.plist"
-          echo "--- entitlements ---"
-          cat "$RUNNER_TEMP/ent.plist"
           BIN="$APP/WebDriverAgentRunner-Runner"
-          echo "--- 架构 ---"
           lipo -info "$BIN" || file "$BIN"
-          echo "--- 先签内嵌 framework，再签主 bundle ---"
-          find "$APP" -name "*.framework" -maxdepth 4 -print0 | while IFS= read -r -d '' f; do
-            codesign --force --sign - "$f" 2>&1 | head -2 || true
+
+          # ── 1. 把 XCTest 运行时从 Xcode 的 iPhoneOS 平台目录搬进 app ──
+          # build-for-testing 不会把 XCTest.framework 打进 Runner.app，
+          # 真机上也没有 /Developer 目录，缺了它 WDA 一启动就 dyld 找不到符号。
+          DEV=$(xcode-select -p)
+          PLAT="$DEV/Platforms/iPhoneOS.platform/Developer"
+          mkdir -p "$APP/Frameworks"
+          echo "--- 平台框架目录 ---"
+          ls "$PLAT/Library/Frameworks" 2>/dev/null || true
+          ls "$PLAT/Library/PrivateFrameworks" 2>/dev/null | head -20 || true
+          for fw in XCTest XCTAutomationSupport XCUIAutomation; do
+            for base in "$PLAT/Library/Frameworks" "$PLAT/Library/PrivateFrameworks"; do
+              if [ -d "$base/$fw.framework" ]; then
+                cp -R "$base/$fw.framework" "$APP/Frameworks/"
+                echo "  + $fw.framework  <- $base"
+                break
+              fi
+            done
+          done
+          # 有些 Xcode 版本把 XCTest 放在 usr/lib 下的 libXCTestBundleInject
+          cp "$PLAT/usr/lib/libXCTestBundleInject.dylib" "$APP/Frameworks/" 2>/dev/null && echo "  + libXCTestBundleInject.dylib" || true
+
+          # ── 2. 改 load command：把 /Developer/... 的绝对路径换成 @rpath ──
+          ABS_XCTEST="/Developer/Library/Frameworks/XCTest.framework/XCTest"
+          ABS_XAS="/Developer/Library/PrivateFrameworks/XCTAutomationSupport.framework/XCTAutomationSupport"
+          ABS_XCUI="/Developer/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation"
+          fix() {
+            b="$1"
+            [ -f "$b" ] || return 0
+            file "$b" | grep -q "Mach-O" || return 0
+            install_name_tool -change "$ABS_XCTEST" "@rpath/XCTest.framework/XCTest" "$b" 2>/dev/null || true
+            install_name_tool -change "$ABS_XAS" "@rpath/XCTAutomationSupport.framework/XCTAutomationSupport" "$b" 2>/dev/null || true
+            install_name_tool -change "$ABS_XCUI" "@rpath/XCUIAutomation.framework/XCUIAutomation" "$b" 2>/dev/null || true
+            install_name_tool -add_rpath "@executable_path/Frameworks" "$b" 2>/dev/null || true
+            install_name_tool -add_rpath "@loader_path/Frameworks" "$b" 2>/dev/null || true
+          }
+          for f in "$APP/Frameworks/"*.framework; do
+            [ -d "$f" ] || continue
+            nm=$(basename "$f" .framework)
+            install_name_tool -id "@rpath/$nm.framework/$nm" "$f/$nm" 2>/dev/null || true
+            fix "$f/$nm"
+          done
+          fix "$BIN"
+          # xctest bundle 里的二进制也要改
+          find "$APP" -name "*.xctest" -type d | while read -r x; do
+            fix "$x/$(basename "$x" .xctest)"
+          done
+
+          echo "--- Runner 依赖 ---"
+          otool -L "$BIN" | head -20
+          echo "--- rpath ---"
+          otool -l "$BIN" | grep -A2 LC_RPATH | head -20
+
+          # ── 3. 重签：先 framework 后 app，TrollStore 靠 CoreTrust 放行 ad-hoc ──
+          echo 'PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPCFET0NUWVBFIHBsaXN0IFBVQkxJQyAiLS8vQXBwbGUvL0RURCBQTElTVCAxLjAvL0VOIiAiaHR0cDovL3d3dy5hcHBsZS5jb20vRFREcy9Qcm9wZXJ0eUxpc3QtMS4wLmR0ZCI+CjxwbGlzdCB2ZXJzaW9uPSIxLjAiPgo8ZGljdD4KICA8a2V5PmdldC10YXNrLWFsbG93PC9rZXk+PHRydWUvPgogIDxrZXk+cGxhdGZvcm0tYXBwbGljYXRpb248L2tleT48dHJ1ZS8+CiAgPGtleT5jb20uYXBwbGUucHJpdmF0ZS5zZWN1cml0eS5uby1jb250YWluZXI8L2tleT48dHJ1ZS8+CiAgPGtleT5jb20uYXBwbGUucHJpdmF0ZS5zZWN1cml0eS5jb250YWluZXItcmVxdWlyZWQ8L2tleT48ZmFsc2UvPgogIDxrZXk+dGFza19mb3JfcGlkLWFsbG93PC9rZXk+PHRydWUvPgogIDxrZXk+cnVuLXVuc2lnbmVkLWNvZGU8L2tleT48dHJ1ZS8+CiAgPGtleT5jb20uYXBwbGUuc2VjdXJpdHkuY3MuYWxsb3ctaml0PC9rZXk+PHRydWUvPgo8L2RpY3Q+CjwvcGxpc3Q+Cg==' | base64 -d > "$RUNNER_TEMP/ent.plist"
+          find "$APP/Frameworks" -name "*.framework" -maxdepth 2 -print0 2>/dev/null | while IFS= read -r -d '' f; do
+            codesign --force --sign - "$f" 2>&1 | head -1 || true
+          done
+          find "$APP" -name "*.dylib" -print0 2>/dev/null | while IFS= read -r -d '' f; do
+            codesign --force --sign - "$f" 2>&1 | head -1 || true
           done
           codesign --force --sign - --entitlements "$RUNNER_TEMP/ent.plist" "$APP"
-          codesign -d --entitlements - "$APP" 2>&1 | head -30 || true
+          echo "--- 签名结果 ---"
+          codesign -dv --entitlements - "$APP" 2>&1 | head -30 || true
+
+          # ── 4. 打包 ──
           mkdir -p "$RUNNER_TEMP/Payload"
           rm -rf "$RUNNER_TEMP/Payload/"*.app
           cp -R "$APP" "$RUNNER_TEMP/Payload/"
@@ -65,7 +132,8 @@ jobs:
           rm -f WebDriverAgent.ipa
           zip -qry WebDriverAgent.ipa Payload
           ls -la WebDriverAgent.ipa
-          unzip -l WebDriverAgent.ipa | head -20
+          echo "--- ipa 结构（Frameworks 必须在）---"
+          unzip -l WebDriverAgent.ipa | grep -E "Frameworks/|Runner.app/$|Info.plist" | head -20
 
       - name: upload
         uses: actions/upload-artifact@v4
