@@ -1,0 +1,18 @@
+name: probe-mac
+on:
+  workflow_dispatch:
+jobs:
+  probe13:
+    runs-on: macos-13
+    steps:
+      - run: |
+          echo "macos-13 ok"
+          xcodebuild -version || true
+          sw_vers
+  probe14:
+    runs-on: macos-14
+    steps:
+      - run: |
+          echo "macos-14 ok"
+          xcodebuild -version || true
+          sw_vers
