@@ -33,6 +33,17 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           echo "DEVELOPER_DIR=$(xcode-select -p)"
 
+      - name: patch project
+        run: |
+          cd wda
+          # Xcode 16 的 actool 编 WDA 的 Assets.xcassets 会 fail（CompileAssetCatalog 报错）。
+          # runner 不需要图标，直接删掉这个 catalog 绕过 actool。
+          rm -rf WebDriverAgentRunner/Assets.xcassets
+          echo "已删除 Assets.xcassets"
+          ls WebDriverAgentRunner/ | head
+          # 顺带确认 scheme 存在
+          ls WebDriverAgent.xcodeproj/xcshareddata/xcschemes/ || true
+
       - name: build-for-testing
         working-directory: wda
         run: |
@@ -43,12 +54,15 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/dd" \
             IPHONEOS_DEPLOYMENT_TARGET=14.0 \
+            ASSETCATALOG_COMPILER_APPICON_NAME= \
+            ASSETCATALOG_COMPILER_LAUNCHIMAGE_NAME= \
+            ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME= \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
             DEVELOPMENT_TEAM="" \
-            2>&1 | tail -60
+            2>&1 | tail -80
 
       - name: package
         run: |
