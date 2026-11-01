@@ -2,17 +2,18 @@ name: build-wda
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "runner 镜像（macos-13 / macos-14）"
+        required: false
+        default: "macos-13"
   push:
     branches: [main]
 
-# 同一时间只跑一个，避免覆盖文件时叠出多个 run
-concurrency:
-  group: wda-build
-  cancel-in-progress: true
-
+# 不设 concurrency：macos-13/14 分别排队，谁先分配用谁，别互相取消
 jobs:
   build:
-    runs-on: macos-13
+    runs-on: ${{ github.event.inputs.runner || 'macos-13' }}
     timeout-minutes: 40
     steps:
       - name: checkout WebDriverAgent
@@ -23,7 +24,8 @@ jobs:
 
       - name: toolchain
         run: |
-          for X in /Applications/Xcode_14.3.app /Applications/Xcode_14.2.app /Applications/Xcode_14.1.app; do
+          echo "runner=${{ runner.os }}/${{ runner.arch }}  image=$RUNNER_IMAGE_OS"
+          for X in /Applications/Xcode_14.3.app /Applications/Xcode_14.2.app /Applications/Xcode_14.1.app /Applications/Xcode.app; do
             if [ -d "$X" ]; then sudo xcode-select -s "$X"; echo "使用 $X"; break; fi
           done
           xcodebuild -version
