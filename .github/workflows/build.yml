@@ -4,16 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: "runner 镜像（macos-13 / macos-14）"
+        description: "runner 镜像（macos-15 / macos-14 / macos-latest）"
         required: false
-        default: "macos-13"
+        default: "macos-15"
   push:
     branches: [main]
 
-# 不设 concurrency：macos-13/14 分别排队，谁先分配用谁，别互相取消
+# macos-13 已在 2025 年被 GitHub 淘汰，挂 macos-13 的 job 会永久 queued 不分配机器。
+# 现在能用的 macOS 池是 macos-14 / macos-15 / macos-latest。
 jobs:
   build:
-    runs-on: ${{ github.event.inputs.runner || 'macos-13' }}
+    runs-on: ${{ github.event.inputs.runner || 'macos-15' }}
     timeout-minutes: 40
     steps:
       - name: checkout WebDriverAgent
@@ -25,7 +26,7 @@ jobs:
       - name: toolchain
         run: |
           echo "runner=${{ runner.os }}/${{ runner.arch }}  image=$RUNNER_IMAGE_OS"
-          for X in /Applications/Xcode_14.3.app /Applications/Xcode_14.2.app /Applications/Xcode_14.1.app /Applications/Xcode.app; do
+          for X in /Applications/Xcode_16.2.app /Applications/Xcode_16.1.app /Applications/Xcode_16.0.app                    /Applications/Xcode_15.4.app /Applications/Xcode_15.2.app /Applications/Xcode.app; do
             if [ -d "$X" ]; then sudo xcode-select -s "$X"; echo "使用 $X"; break; fi
           done
           xcodebuild -version
