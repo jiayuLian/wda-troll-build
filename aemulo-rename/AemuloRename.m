@@ -17,7 +17,7 @@
 #include <string.h>
 
 // 版本标记：CI 用它做硬断言，认版本别认文件大小
-static NSString *const kAGVer = @"AG_VER_V2";
+static NSString *const kAGVer = @"AG_VER_V3";
 
 static NSString *const kAGGroupID = @"group.amywhile.aemulo";
 static NSString *const kAGDBName = @"TagDatabase.sqlite3";
@@ -223,6 +223,187 @@ static NSString *AGExportDatabase(NSString *dbPath) {
     }
     NSLog(@"[AemuloRename] exported %@", dst);
     return dst;
+}
+
+#pragma mark - 汉化
+
+// 词典：英文原文 → 中文。只做整串精确匹配 + 少量前缀规则，
+// 不动卡片名之类用户数据（除非恰好等于"Name"这种 UI 词）。
+static NSString *AGTranslate(NSString *s) {
+    if (!s.length) return s;
+    static NSDictionary<NSString *, NSString *> *map = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        map = @{
+            // 主流程 / 读卡
+            @"Present Tag to Read":        @"将标签贴近手机",
+            @"Present Phone to Reader":    @"将手机贴近读卡器",
+            @"Read Tag":                   @"读取标签",
+            @"Standard Reader":            @"标准读卡器",
+            @"Ultralight Reader":          @"Ultralight 读卡器",
+            @"Amiibo Reader":              @"Amiibo 读卡器",
+            @"MiFare Dictionary Attack":   @"MiFare 字典攻击",
+            @"Manually Create":            @"手动创建",
+            @"Connecting to chip":         @"正在连接芯片",
+            @"Scanning":                   @"扫描中",
+            @"Scan":                       @"扫描",
+            @"Emulate":                    @"模拟",
+            @"Start":                      @"开始",
+            @"Stop":                       @"停止",
+            // 通用
+            @"Save":                       @"保存",
+            @"Save and Close":             @"保存并关闭",
+            @"Discard and Close":          @"放弃并关闭",
+            @"Discard":                    @"放弃",
+            @"Cancel":                     @"取消",
+            @"Close":                      @"关闭",
+            @"Back":                       @"返回",
+            @"Done":                       @"完成",
+            @"Edit":                       @"编辑",
+            @"Delete":                     @"删除",
+            @"Add":                        @"添加",
+            @"Name":                       @"名称",
+            @"Date":                       @"日期",
+            @"Date Added":                 @"添加时间",
+            @"Type":                       @"类型",
+            @"Favourite":                  @"收藏",
+            @"Favorite":                   @"收藏",
+            @"Favourites":                 @"收藏",
+            @"Favorites":                  @"收藏",
+            @"Sort By":                    @"排序方式",
+            @"Sort By Name":               @"按名称排序",
+            @"Enable Haptics":             @"触感反馈",
+            @"General":                    @"通用",
+            @"Settings":                   @"设置",
+            @"Reader Settings":            @"读卡器设置",
+            @"Language Preference":        @"语言偏好",
+            @"Change Log":                 @"更新日志",
+            @"About":                      @"关于",
+            @"Version":                    @"版本",
+            @"Beta":                       @"测试版",
+            @"Tags":                       @"标签",
+            @"Cards":                      @"卡片",
+            @"Home":                       @"主页",
+            @"Tag Info":                   @"标签信息",
+            @"Unknown Tag Type":           @"未知标签类型",
+            @"Sign in with Chariz":        @"使用 Chariz 登录",
+            @"Made with love":             @"用爱制作",
+            // 设置项 / 提示
+            @"Added Key Path":             @"已添加密钥路径",
+            @"Amiibo Key Path":            @"Amiibo 密钥路径",
+            @"Invalid Key Path":           @"密钥路径无效",
+            @"key_retail.bin is invalid size. Should be 160 bytes.": @"key_retail.bin 大小不对，应为 160 字节。",
+            @"key_retain.bin does not match expected file hash.":    @"key_retain.bin 与预期哈希不符。",
+            @"Which tag types to search for. If unsure leave all enabled.": @"选择要搜索的标签类型，不确定就全部保持开启。",
+            @"Type A":                     @"A 型",
+            @"Type B":                     @"B 型",
+            @"Type ACM":                   @"ACM 型",
+            @"Type V":                     @"V 型",
+            @"Type ISO 15693":             @"ISO 15693",
+            // 错误
+            @"Failed to create database connection": @"无法创建数据库连接",
+            @"Failed to load changelogs":  @"更新日志加载失败",
+            @"Error Connecting to Socket": @"连接失败",
+            @"Failed to initialise chip.": @"芯片初始化失败。",
+            @"Failed to communicate with chip.": @"与芯片通信失败。",
+            @"Failed to reset chip.":      @"芯片复位失败。",
+            @"Failed to reset chip":       @"芯片复位失败",
+            @"Failed to make socket.":     @"创建连接失败。",
+            @"Client has invalid IOKit permissions.": @"客户端 IOKit 权限无效。",
+            @"No tag detected":            @"未检测到标签",
+            @"Not supported":              @"不支持",
+            @"Unsupported":                @"不支持",
+            @"Unknown":                    @"未知",
+            @"Error":                      @"错误",
+            @"OK":                         @"好",
+        };
+    });
+    NSString *hit = map[s];
+    if (hit) return hit;
+    if ([s hasPrefix:@"Failed with: "])
+        return [@"失败：" stringByAppendingString:[s substringFromIndex:13]];
+    return s;
+}
+
+// —— UIView 文本入口全部过一遍词典 ——
+static void (*AGOrigSetText)(id, SEL, NSString *);
+static void AGSetText(id self, SEL _cmd, NSString *text) {
+    AGOrigSetText(self, _cmd, AGTranslate(text));
+}
+
+static void (*AGOrigSetAttrText)(id, SEL, NSAttributedString *);
+static void AGSetAttrText(id self, SEL _cmd, NSAttributedString *text) {
+    if (!text.length) { AGOrigSetAttrText(self, _cmd, text); return; }
+    NSString *zh = AGTranslate(text.string);
+    if (zh == text.string || [zh isEqualToString:text.string]) { AGOrigSetAttrText(self, _cmd, text); return; }
+    NSMutableAttributedString *m = [text mutableCopy];
+    [m replaceCharactersInRange:NSMakeRange(0, m.length) withString:zh];
+    AGOrigSetAttrText(self, _cmd, m);
+}
+
+static void (*AGOrigButtonTitle)(id, SEL, NSString *, UIControlState);
+static void AGButtonTitle(id self, SEL _cmd, NSString *title, UIControlState state) {
+    AGOrigButtonTitle(self, _cmd, AGTranslate(title), state);
+}
+
+static void (*AGOrigNavTitle)(id, SEL, NSString *);
+static void AGNavTitle(id self, SEL _cmd, NSString *title) {
+    AGOrigNavTitle(self, _cmd, AGTranslate(title));
+}
+
+// UIViewController:-setTitle: 和 UINavigationItem:-setTitle: 是两个不同的实现，
+// 必须各存一份原始 IMP，否则第二次 swizzle 会把第一次的指针覆盖掉。
+static void (*AGOrigVCTitle)(id, SEL, NSString *);
+static void AGVCTitle(id self, SEL _cmd, NSString *title) {
+    AGOrigVCTitle(self, _cmd, AGTranslate(title));
+}
+
+static void (*AGOrigBarItemTitle)(id, SEL, NSString *);
+static void AGBarItemTitle(id self, SEL _cmd, NSString *title) {
+    AGOrigBarItemTitle(self, _cmd, AGTranslate(title));
+}
+
+static void (*AGOrigPlaceholder)(id, SEL, NSString *);
+static void AGPlaceholder(id self, SEL _cmd, NSString *text) {
+    AGOrigPlaceholder(self, _cmd, AGTranslate(text));
+}
+
+static void (*AGOrigSegmentTitle)(id, SEL, NSString *, NSInteger);
+static void AGSegmentTitle(id self, SEL _cmd, NSString *title, NSInteger idx) {
+    AGOrigSegmentTitle(self, _cmd, AGTranslate(title), idx);
+}
+
+static id (*AGOrigAlert)(id, SEL, NSString *, NSString *, UIAlertControllerStyle);
+static id AGAlert(id self, SEL _cmd, NSString *title, NSString *message, UIAlertControllerStyle style) {
+    return AGOrigAlert(self, _cmd, AGTranslate(title), AGTranslate(message), style);
+}
+
+static id (*AGOrigAction)(id, SEL, NSString *, UIAlertActionStyle, void (^)(UIAlertAction *));
+static id AGAction(id self, SEL _cmd, NSString *title, UIAlertActionStyle style, void (^handler)(UIAlertAction *)) {
+    return AGOrigAction(self, _cmd, AGTranslate(title), style, handler);
+}
+
+static void __attribute__((unused)) AGSwizzleTextSetters(void) {
+    struct { Class cls; SEL sel; void *impl; void **orig; BOOL classMethod; } table[] = {
+        { [UILabel class], @selector(setText:), (void *)AGSetText, (void **)&AGOrigSetText, NO },
+        { [UILabel class], @selector(setAttributedText:), (void *)AGSetAttrText, (void **)&AGOrigSetAttrText, NO },
+        { [UIButton class], @selector(setTitle:forState:), (void *)AGButtonTitle, (void **)&AGOrigButtonTitle, NO },
+        { [UINavigationItem class], @selector(setTitle:), (void *)AGNavTitle, (void **)&AGOrigNavTitle, NO },
+        { [UIViewController class], @selector(setTitle:), (void *)AGVCTitle, (void **)&AGOrigVCTitle, NO },
+        { [UIBarButtonItem class], @selector(setTitle:), (void *)AGBarItemTitle, (void **)&AGOrigBarItemTitle, NO },
+        { [UITextField class], @selector(setPlaceholder:), (void *)AGPlaceholder, (void **)&AGOrigPlaceholder, NO },
+        { [UISegmentedControl class], @selector(setTitle:forSegmentAtIndex:), (void *)AGSegmentTitle, (void **)&AGOrigSegmentTitle, NO },
+        { [UIAlertController class], @selector(alertControllerWithTitle:message:preferredStyle:), (void *)AGAlert, (void **)&AGOrigAlert, YES },
+        { [UIAlertAction class], @selector(actionWithTitle:style:handler:), (void *)AGAction, (void **)&AGOrigAction, YES },
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        Method m = table[i].classMethod
+            ? class_getClassMethod(table[i].cls, table[i].sel)
+            : class_getInstanceMethod(table[i].cls, table[i].sel);
+        if (!m) continue;
+        *table[i].orig = (void *)method_getImplementation(m);
+        method_setImplementation(m, (IMP)table[i].impl);
+    }
 }
 
 #pragma mark - 列表页
@@ -532,6 +713,7 @@ static void AGAttachWindowGesture(void) {
 __attribute__((constructor))
 static void AGInit(void) {
     NSLog(@"[AemuloRename] loaded · %@ · substrate-free", kAGVer);
+    AGSwizzleTextSetters();
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                       object:nil queue:[NSOperationQueue mainQueue]
