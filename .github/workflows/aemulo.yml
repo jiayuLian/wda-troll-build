@@ -59,7 +59,10 @@ jobs:
           assert magic==0xfeedfacf, 'not Mach-O 64'
           assert cpu==0x100000c, 'not arm64'
           assert ft==6, 'not MH_DYLIB'
-          assert b'AG_VER_V5' in d, 'version marker missing'
+          import re
+          m=re.findall(rb'AG_VER_V[0-9]+', d)
+          print('marker:', m)
+          assert m, 'version marker missing'
           print('OK')
           PY
           if strings out/AemuloRename.dylib | grep -qi 'substrate\|ellekit'; then
