@@ -13,11 +13,12 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <sqlite3.h>
 #include <string.h>
 
 // 版本标记：CI 用它做硬断言，认版本别认文件大小
-static NSString *const kAGVer = @"AG_VER_V5";
+static NSString *const kAGVer = @"AG_VER_V6";
 
 static NSString *const kAGGroupID = @"group.amywhile.aemulo";
 static NSString *const kAGDBName = @"TagDatabase.sqlite3";
@@ -475,12 +476,20 @@ static NSString *AGNameForUIDText(NSString *s) {
     return hit;
 }
 
+static const void *kAGOrigTextKey = &kAGOrigTextKey;
+
 static void AGFixLabelsIn(UIView *v) {
     if ([v isKindOfClass:[UILabel class]]) {
         UILabel *l = (UILabel *)v;
         if (AGIsUIDText(l.text)) {
             NSString *n = AGNameForUIDText(l.text);
-            if (n.length && AGOrigSetText) AGOrigSetText(l, @selector(setText:), n);
+            if (n.length && AGOrigSetText) {
+                // 换成名字之前把 UID 原文挂在 label 上：
+                // 之后这一行要反查是哪张卡（滑动操作 / 删除）就靠它，
+                // 不能靠名字，名字可能重名。
+                objc_setAssociatedObject(l, kAGOrigTextKey, l.text, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                AGOrigSetText(l, @selector(setText:), n);
+            }
         }
         return;
     }
@@ -514,6 +523,226 @@ static void AGReloadTablesIn(UIView *v) {
 static void AGRefreshOtherTables(void) {
     AGRebuildNameMap();
     for (UIWindow *w in UIApplication.sharedApplication.windows) AGReloadTablesIn(w);
+}
+
+
+#pragma mark - 主页行操作（左滑改名/删除）
+
+// 这两个在文件后面才定义（入口 / swizzle 段），先声明
+static UIViewController *AGTopViewController(void);
+static BOOL AGIsTagListController(UIViewController *vc);
+
+// 删掉的卡：Aemulo 的首页列表是启动时建的模型，库删了这一行它照样画。
+// 所以删完在自己的进程里记一笔"墓碑"，靠 heightForRow 把这一行压成 0 高度。
+static NSMutableSet<NSString *> *AGDeletedUUIDs = nil;
+static NSMutableSet<NSString *> *AGDeletedUIDKeys = nil;
+
+static void AGMarkDeleted(NSString *uuid, NSString *uidKey) {
+    if (!AGDeletedUUIDs) AGDeletedUUIDs = [NSMutableSet set];
+    if (!AGDeletedUIDKeys) AGDeletedUIDKeys = [NSMutableSet set];
+    if (uuid.length) [AGDeletedUUIDs addObject:uuid];
+    if (uidKey.length) [AGDeletedUIDKeys addObject:uidKey];
+}
+
+static BOOL AGDeleteCardRecord(NSString *dbPath, NSDictionary *card) {
+    BOOL ok = AGDeleteCard(dbPath, card[@"table"], card[@"uuid"]);
+    if (ok) {
+        NSString *uid = [card[@"uid"] uppercaseString];
+        AGMarkDeleted(card[@"uuid"], uid.length ? [@"0x" stringByAppendingString:uid] : nil);
+        NSLog(@"[AemuloRename] deleted %@ (%@)", card[@"name"], card[@"uid"]);
+    }
+    return ok;
+}
+
+// 从 cell 的 label 反推这张卡：优先用挂上去的 UID 原文
+static NSString *AGCellUIDKey(UITableViewCell *cell) {
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
+    while (stack.count) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:[UILabel class]]) {
+            UILabel *l = (UILabel *)v;
+            NSString *orig = objc_getAssociatedObject(l, kAGOrigTextKey) ?: l.text;
+            if (AGIsUIDText(orig)) return AGUIDKey(orig);
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+    return nil;
+}
+
+static NSString *AGCellUIDKeyAt(UITableView *tv, NSIndexPath *ip) {
+    UITableViewCell *cell = [tv cellForRowAtIndexPath:ip];
+    return cell ? AGCellUIDKey(cell) : nil;
+}
+
+// uidKey 形如 0xC30AC319
+static NSDictionary *AGCardForUIDKey(NSString *uidKey) {
+    if (!uidKey.length) return nil;
+    NSString *want = [uidKey uppercaseString];
+    for (NSDictionary *c in AGLoadCards(AGDatabasePath())) {
+        NSString *uid = [c[@"uid"] uppercaseString];
+        if (!uid.length) continue;
+        if ([[@"0x" stringByAppendingString:uid] isEqualToString:want]) return c;
+        NSString *pad = uid;
+        while (pad.length < 8) pad = [@"0" stringByAppendingString:pad];
+        if ([[@"0x" stringByAppendingString:pad] isEqualToString:want]) return c;
+    }
+    return nil;
+}
+
+static NSDictionary *AGCardAtRow(UITableView *tv, NSIndexPath *ip) {
+    return AGCardForUIDKey(AGCellUIDKeyAt(tv, ip));
+}
+
+static void AGToast(NSString *title, NSString *message) {
+    UIViewController *top = AGTopViewController();
+    if (!top) return;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                               message:message
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [top presentViewController:a animated:YES completion:nil];
+}
+
+static void AGPromptRename(NSDictionary *card) {
+    UIViewController *top = AGTopViewController();
+    if (!top) return;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"重命名"
+                                                                message:[NSString stringWithFormat:@"%@ · 0x%@",
+                                                                         card[@"table"], card[@"uid"]]
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = card[@"name"];
+        tf.placeholder = @"备注名";
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *a) {
+        NSString *name = [ac.textFields.firstObject.text
+                          stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!name.length) { AGToast(@"名字不能为空", nil); return; }
+        BOOL ok = AGRenameCard(AGDatabasePath(), card[@"table"], card[@"uuid"], name);
+        AGRefreshOtherTables();
+        if (!ok) AGToast(@"改名失败", @"数据库可能被占用，稍后再试。");
+    }]];
+    [top presentViewController:ac animated:YES completion:nil];
+}
+
+static void AGConfirmDelete(NSDictionary *card, void (^done)(BOOL)) {
+    UIViewController *top = AGTopViewController();
+    if (!top) { if (done) done(NO); return; }
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"删除这张卡？"
+                                                                message:[NSString stringWithFormat:@"%@\n0x%@",
+                                                                         card[@"name"], card[@"uid"]]
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                        handler:^(UIAlertAction *a) { if (done) done(NO); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        BOOL ok = AGDeleteCardRecord(AGDatabasePath(), card);
+        AGRefreshOtherTables();
+        if (!ok) AGToast(@"删除失败", @"数据库可能被占用，重开 App 后再试。");
+        if (done) done(ok);
+    }]];
+    [top presentViewController:ac animated:YES completion:nil];
+}
+
+// 主页表格的 delegate 代理：只接管两条方法，其它全部转发给原 delegate
+@interface AGTableProxy : NSObject <UITableViewDelegate>
+@property (nonatomic, weak) id orig;
+@end
+
+@implementation AGTableProxy
+
+- (BOOL)respondsToSelector:(SEL)sel {
+    if ([super respondsToSelector:sel]) return YES;
+    return [self.orig respondsToSelector:sel];
+}
+
+- (id)forwardingTargetForSelector:(SEL)sel {
+    return self.orig;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSString *key = AGCellUIDKeyAt(tableView, indexPath);
+    if (key.length && [AGDeletedUIDKeys containsObject:key]) return 0.0;
+    SEL s = _cmd;
+    if ([self.orig respondsToSelector:s]) {
+        CGFloat (*fn)(id, SEL, UITableView *, NSIndexPath *) = (void *)objc_msgSend;
+        return fn(self.orig, s, tableView, indexPath);
+    }
+    // UIKit 的默认行为就是取 rowHeight，原样返回不改变原有布局
+    return tableView.rowHeight;
+}
+
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+    trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UISwipeActionsConfiguration *base = nil;
+    SEL s = _cmd;
+    if ([self.orig respondsToSelector:s]) {
+        UISwipeActionsConfiguration *(*fn)(id, SEL, UITableView *, NSIndexPath *) = (void *)objc_msgSend;
+        base = fn(self.orig, s, tableView, indexPath);
+    }
+    NSDictionary *card = AGCardAtRow(tableView, indexPath);
+    if (!card) return base;
+
+    UIContextualAction *del =
+        [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
+                                                title:@"删除"
+                                              handler:^(UIContextualAction *action, UIView *src,
+                                                        void (^completion)(BOOL)) {
+        AGConfirmDelete(card, ^(BOOL ok) {
+            [tableView reloadData];
+            completion(ok);
+        });
+    }];
+
+    UIContextualAction *ren =
+        [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+                                                title:@"改名"
+                                              handler:^(UIContextualAction *action, UIView *src,
+                                                        void (^completion)(BOOL)) {
+        completion(YES);
+        AGPromptRename(card);
+    }];
+    ren.backgroundColor = [UIColor systemBlueColor];
+
+    UISwipeActionsConfiguration *cfg =
+        [UISwipeActionsConfiguration configurationWithActions:@[del, ren]];
+    cfg.performsFirstActionWithFullSwipe = NO;  // 防止一划就删
+    return cfg;
+}
+
+@end
+
+static const void *kAGProxyKey = &kAGProxyKey;
+
+static UITableView *AGFindTableView(UIView *v) {
+    if ([v isKindOfClass:[UITableView class]]) {
+        // 自己的卡片管理页不接管
+        Class listCls = objc_getClass("AGCardListVC");
+        if (listCls && [((UITableView *)v).dataSource isKindOfClass:listCls]) return nil;
+        return (UITableView *)v;
+    }
+    for (UIView *s in v.subviews) {
+        UITableView *t = AGFindTableView(s);
+        if (t) return t;
+    }
+    return nil;
+}
+
+static void AGInstallTableProxy(UIViewController *vc) {
+    if (!AGIsTagListController(vc)) return;
+    UITableView *tv = AGFindTableView(vc.view);
+    if (!tv || !tv.delegate) return;
+    if ([tv.delegate isKindOfClass:[AGTableProxy class]]) return;
+
+    AGTableProxy *p = [[AGTableProxy alloc] init];
+    p.orig = tv.delegate;
+    objc_setAssociatedObject(tv, kAGProxyKey, p, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    tv.delegate = p;
+    NSLog(@"[AemuloRename] table proxy installed on %@", NSStringFromClass([tv class]));
 }
 
 #pragma mark - 列表页
@@ -611,7 +840,7 @@ static void AGRefreshOtherTables(void) {
                                             handler:^(UIAlertAction *a) { completion(NO); }]];
         [ac addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
                                             handler:^(UIAlertAction *a) {
-            BOOL ok = AGDeleteCard(weakSelf.dbPath, c[@"table"], c[@"uuid"]);
+            BOOL ok = AGDeleteCardRecord(weakSelf.dbPath, c);
             if (ok) {
                 [weakSelf reload];
                 AGRefreshOtherTables();
@@ -771,6 +1000,8 @@ static void AGInstallEntry(UIViewController *vc) {
     for (UIBarButtonItem *i in existing) {
         if ([i.title isEqualToString:@"改名"]) return;
     }
+
+    AGInstallTableProxy(vc);
 
     UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:@"改名"
                                                              style:UIBarButtonItemStylePlain
