@@ -14,44 +14,84 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <unistd.h>
 #import <sqlite3.h>
 #include <string.h>
 
 // 版本标记：CI 用它做硬断言，认版本别认文件大小
-static NSString *const kAGVer = @"AG_VER_V6";
+static NSString *const kAGVer = @"AG_VER_V7";
 
 static NSString *const kAGGroupID = @"group.amywhile.aemulo";
 static NSString *const kAGDBName = @"TagDatabase.sqlite3";
 
 #pragma mark - 数据库路径
 
-// App Group 容器路径。entitlement 拿不到时退化为扫目录。
+// 单个库里的总行数（只读，打不开返回 -1）
+static long AGCountRows(NSString *path) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(path.fileSystemRepresentation, &db,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_busy_timeout(db, 1500);
+    long total = 0;
+    const char *names[] = {"MiFareTagTable", "EMVTagTable", "AmiiboTagTable",
+                           "NDEFTagTable", "GenericATag", "GenericBTag", "GenericFTag"};
+    for (int i = 0; i < 7; i++) {
+        NSString *q = [NSString stringWithFormat:@"SELECT COUNT(*) FROM \"%@\"",
+                                         [NSString stringWithUTF8String:names[i]]];
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, q.UTF8String, -1, &st, NULL) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) total += sqlite3_column_int(st, 0);
+            sqlite3_finalize(st);
+        }
+    }
+    sqlite3_close(db);
+    return total;
+}
+
+// 可能有不止一份 TagDatabase.sqlite3（App Group / 老容器 / 重装留下的副本）。
+// 早先"第一份存在的就用"试过坑：选中的是空副本，于是列表空、改名写进另一份。
+// 现在把候选全找出来，挑行数最多的那份。
+static NSString *AGDBPathCache = nil;
+
 static NSString *AGDatabasePath(void) {
-    static NSString *cached = nil;
-    if (cached) return cached;
+    if (AGDBPathCache) return AGDBPathCache;
 
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *cands = [NSMutableArray array];
+
     NSURL *group = [fm containerURLForSecurityApplicationGroupIdentifier:kAGGroupID];
     if (group) {
         NSString *p = [[group URLByAppendingPathComponent:kAGDBName] path];
-        if ([fm fileExistsAtPath:p]) {
-            cached = p;
-            return cached;
-        }
+        if ([fm fileExistsAtPath:p]) [cands addObject:p];
     }
-    // 兜底：AppGroup 根目录下逐个找（进程有该 group 权限时才读得到）
     NSString *base = @"/var/mobile/Containers/Shared/AppGroup";
     for (NSString *sub in [fm contentsOfDirectoryAtPath:base error:NULL]) {
         NSString *p = [base stringByAppendingPathComponent:
                        [sub stringByAppendingPathComponent:kAGDBName]];
-        if ([fm fileExistsAtPath:p]) {
-            cached = p;
-            return cached;
-        }
+        if ([fm fileExistsAtPath:p] && ![cands containsObject:p]) [cands addObject:p];
     }
-    NSLog(@"[AemuloRename] TagDatabase.sqlite3 not found");
-    return nil;
+
+    NSString *best = nil;
+    long bestRows = -2;
+    for (NSString *p in cands) {
+        long n = AGCountRows(p);
+        NSLog(@"[AemuloRename] candidate %@ rows=%ld", p, n);
+        if (n > bestRows) { bestRows = n; best = p; }
+    }
+    if (!best) {
+        NSLog(@"[AemuloRename] TagDatabase.sqlite3 not found");
+        return nil;
+    }
+    AGDBPathCache = best;
+    return AGDBPathCache;
 }
+
+// 读失败时清掉缓存，下次重新在所有候选里挑
+static void AGInvalidateDatabasePath(void) { AGDBPathCache = nil; }
+
 
 #pragma mark - 数据库读写
 
@@ -62,18 +102,35 @@ static NSString *const kAGTables[] = {
 static const NSUInteger kAGTableCount = sizeof(kAGTables) / sizeof(kAGTables[0]);
 
 // 返回 @[@{table, uuid, name, uid}]，按名字排序。uid 有就带（hex 文本）。
-static NSArray<NSDictionary *> *AGLoadCards(NSString *dbPath) {
+// errOut 不为空时回填失败原因 —— Aemulo 自己也在写这个库，偶尔会拿到 SQLITE_BUSY，
+// 静默返回空数组会让人以为"库里没卡"，所以错误必须往上传。
+static NSArray<NSDictionary *> *AGLoadCardsErr(NSString *dbPath, NSString **errOut) {
     NSMutableArray *out = [NSMutableArray array];
-    if (!dbPath) return out;
-
-    sqlite3 *db = NULL;
-    if (sqlite3_open_v2(dbPath.fileSystemRepresentation, &db,
-                        SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        NSLog(@"[AemuloRename] open(readonly) failed: %s", sqlite3_errmsg(db));
-        if (db) sqlite3_close(db);
+    if (errOut) *errOut = nil;
+    if (!dbPath) {
+        if (errOut) *errOut = @"没找到 TagDatabase.sqlite3";
         return out;
     }
-    sqlite3_busy_timeout(db, 2000);
+
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(dbPath.fileSystemRepresentation, &db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL);
+    if (rc != SQLITE_OK) {
+        // 没有写权限时退一步只读
+        if (db) sqlite3_close(db);
+        db = NULL;
+        rc = sqlite3_open_v2(dbPath.fileSystemRepresentation, &db,
+                             SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, NULL);
+    }
+    if (rc != SQLITE_OK) {
+        NSString *e = [NSString stringWithFormat:@"打不开库(%d): %s", rc, db ? sqlite3_errmsg(db) : "?"];
+        NSLog(@"[AemuloRename] %@ @ %@", e, dbPath);
+        if (db) sqlite3_close(db);
+        if (errOut) *errOut = e;
+        return out;
+    }
+    // 必须在 prepare 之前设，否则拿到 BUSY 直接失败
+    sqlite3_busy_timeout(db, 3000);
 
     for (NSUInteger i = 0; i < kAGTableCount; i++) {
         NSString *table = kAGTables[i];
@@ -84,9 +141,16 @@ static NSArray<NSDictionary *> *AGLoadCards(NSString *dbPath) {
         BOOL hasUID = YES;
         if (sqlite3_prepare_v2(db, sql.UTF8String, -1, &st, NULL) != SQLITE_OK) {
             hasUID = NO;
+            NSString *firstErr = [NSString stringWithUTF8String:sqlite3_errmsg(db)];
             sql = [NSString stringWithFormat:
                    @"SELECT uuid, name FROM \"%@\" ORDER BY name COLLATE NOCASE", table];
-            if (sqlite3_prepare_v2(db, sql.UTF8String, -1, &st, NULL) != SQLITE_OK) continue;
+            if (sqlite3_prepare_v2(db, sql.UTF8String, -1, &st, NULL) != SQLITE_OK) {
+                NSLog(@"[AemuloRename] prepare %@ failed: %@ / %s",
+                      table, firstErr, sqlite3_errmsg(db));
+                if (errOut && !*errOut)
+                    *errOut = [NSString stringWithFormat:@"读 %@ 失败: %s", table, sqlite3_errmsg(db)];
+                continue;
+            }
         }
         while (sqlite3_step(st) == SQLITE_ROW) {
             const char *uuid = (const char *)sqlite3_column_text(st, 0);
@@ -104,6 +168,17 @@ static NSArray<NSDictionary *> *AGLoadCards(NSString *dbPath) {
     }
     sqlite3_close(db);
     return out;
+}
+
+static NSArray<NSDictionary *> *AGLoadCards(NSString *dbPath) {
+    NSString *err = nil;
+    NSArray *a = AGLoadCardsErr(dbPath, &err);
+    if (a.count == 0 && err.length) {
+        // 一次 120ms 的重试，足够躲过 Aemulo 的一次提交
+        usleep(60 * 1000);
+        a = AGLoadCardsErr(dbPath, NULL);
+    }
+    return a;
 }
 
 static BOOL AGRenameCard(NSString *dbPath, NSString *table, NSString *uuid, NSString *newName) {
@@ -478,6 +553,9 @@ static NSString *AGNameForUIDText(NSString *s) {
 
 static const void *kAGOrigTextKey = &kAGOrigTextKey;
 
+// 主页 indexPath → uidKey，见 AGTableProxy
+static NSMutableDictionary<NSString *, NSString *> *AGRowUIDMap = nil;
+
 static void AGFixLabelsIn(UIView *v) {
     if ([v isKindOfClass:[UILabel class]]) {
         UILabel *l = (UILabel *)v;
@@ -508,6 +586,40 @@ static void AGCellLayout(id self, SEL _cmd) {
     AGFixLabelsIn((UIView *)self);
 }
 
+// 已显示的 cell 立刻改文本：reloadData 之后 UIKit 才会重建 cell，
+// 这中间有一帧还挂着旧名字，看着就是"过一会才变"。
+static void AGRelabelVisibleCells(void) {
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+        while (stack.count) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if ([v isKindOfClass:[UITableView class]]) {
+                for (UITableViewCell *c in ((UITableView *)v).visibleCells) {
+                    NSMutableArray *s2 = [NSMutableArray arrayWithObject:c];
+                    while (s2.count) {
+                        UIView *x = s2.lastObject;
+                        [s2 removeLastObject];
+                        if ([x isKindOfClass:[UILabel class]]) {
+                            UILabel *l = (UILabel *)x;
+                            NSString *orig = objc_getAssociatedObject(l, kAGOrigTextKey);
+                            if (orig.length && AGIsUIDText(orig)) {
+                                NSString *n = AGNameForUIDText(orig);
+                                if (n.length && ![l.text isEqualToString:n] && AGOrigSetText) {
+                                    AGOrigSetText(l, @selector(setText:), n);
+                                }
+                            }
+                        }
+                        [s2 addObjectsFromArray:x.subviews];
+                    }
+                }
+                continue;
+            }
+            [stack addObjectsFromArray:v.subviews];
+        }
+    }
+}
+
 static void AGReloadTablesIn(UIView *v) {
     if ([v isKindOfClass:[UITableView class]]) {
         UITableView *tv = (UITableView *)v;
@@ -522,7 +634,10 @@ static void AGReloadTablesIn(UIView *v) {
 
 static void AGRefreshOtherTables(void) {
     AGRebuildNameMap();
+    // 行号会变，旧映射必须丢掉，否则可能把刚出现的行按墓碑压掉
+    [AGRowUIDMap removeAllObjects];
     for (UIWindow *w in UIApplication.sharedApplication.windows) AGReloadTablesIn(w);
+    AGRelabelVisibleCells();
 }
 
 
@@ -648,7 +763,15 @@ static void AGConfirmDelete(NSDictionary *card, void (^done)(BOOL)) {
     [top presentViewController:ac animated:YES completion:nil];
 }
 
-// 主页表格的 delegate 代理：只接管两条方法，其它全部转发给原 delegate
+// 主页表格的 delegate 代理：只接管三条方法，其它全部转发给原 delegate
+// indexPath → uidKey：heightForRow 在 cell 创建之前就会调，
+// 那时拿不到 cell，只能靠 willDisplayCell 的时候记下来的这张表。
+static void AGCollapseDeletedRows(void);
+
+static NSString *AGRowKey(NSIndexPath *ip) {
+    return [NSString stringWithFormat:@"%ld-%ld", (long)ip.section, (long)ip.row];
+}
+
 @interface AGTableProxy : NSObject <UITableViewDelegate>
 @property (nonatomic, weak) id orig;
 @end
@@ -664,8 +787,24 @@ static void AGConfirmDelete(NSDictionary *card, void (^done)(BOOL)) {
     return self.orig;
 }
 
+- (void)tableView:(UITableView *)tableView
+      willDisplayCell:(UITableViewCell *)cell
+    forRowAtIndexPath:(NSIndexPath *)indexPath {
+    SEL s = _cmd;
+    if ([self.orig respondsToSelector:s]) {
+        void (*fn)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *) = (void *)objc_msgSend;
+        fn(self.orig, s, tableView, cell, indexPath);
+    }
+    NSString *key = AGCellUIDKey(cell);
+    if (!AGRowUIDMap) AGRowUIDMap = [NSMutableDictionary dictionary];
+    if (key.length) AGRowUIDMap[AGRowKey(indexPath)] = key;
+    // 删掉的卡：Aemulo 的模型里还有，直接藏掉这一格
+    cell.hidden = (key.length && [AGDeletedUIDKeys containsObject:key]);
+}
+
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    NSString *key = AGCellUIDKeyAt(tableView, indexPath);
+    NSString *key = AGRowUIDMap[AGRowKey(indexPath)];
+    if (!key.length) key = AGCellUIDKeyAt(tableView, indexPath);
     if (key.length && [AGDeletedUIDKeys containsObject:key]) return 0.0;
     SEL s = _cmd;
     if ([self.orig respondsToSelector:s]) {
@@ -694,6 +833,7 @@ static void AGConfirmDelete(NSDictionary *card, void (^done)(BOOL)) {
                                                         void (^completion)(BOOL)) {
         AGConfirmDelete(card, ^(BOOL ok) {
             [tableView reloadData];
+            AGCollapseDeletedRows();
             completion(ok);
         });
     }];
@@ -716,7 +856,72 @@ static void AGConfirmDelete(NSDictionary *card, void (^done)(BOOL)) {
 
 @end
 
+// 重新问一遍行高：墓碑行的 heightForRow 返回 0，这一行就塌掉（不是留个空白）
+static void AGCollapseDeletedRows(void) {
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:w];
+        while (stack.count) {
+            UIView *v = stack.lastObject;
+            [stack removeLastObject];
+            if ([v isKindOfClass:[UITableView class]]) {
+                UITableView *tv = (UITableView *)v;
+                if ([tv.delegate isKindOfClass:[AGTableProxy class]]) {
+                    [tv beginUpdates];
+                    [tv endUpdates];
+                }
+                continue;
+            }
+            [stack addObjectsFromArray:v.subviews];
+        }
+    }
+}
+
+// 单指长按一行 = 后备入口。左滑依赖 delegate 代理，
+// 万一 Aemulo 换控件或重置 delegate，这条还能用。
+@interface AGRowMenu : NSObject
+@property (nonatomic, weak) UITableView *tv;
+- (void)handle:(UILongPressGestureRecognizer *)g;
+@end
+
+@implementation AGRowMenu
+
+- (void)handle:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    CGPoint p = [g locationInView:self.tv];
+    NSIndexPath *ip = [self.tv indexPathForRowAtPoint:p];
+    if (!ip) return;
+    NSDictionary *card = AGCardAtRow(self.tv, ip);
+    if (!card) return;
+
+    UIViewController *top = AGTopViewController();
+    if (!top) return;
+    UIAlertController *ac =
+        [UIAlertController alertControllerWithTitle:card[@"name"]
+                                            message:[NSString stringWithFormat:@"%@ · 0x%@",
+                                                     card[@"table"], card[@"uid"]]
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ac.popoverPresentationController.sourceView = self.tv;
+    ac.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.tv.bounds) - 1,
+                                                             CGRectGetMidY(self.tv.bounds) - 1, 2, 2);
+    [ac addAction:[UIAlertAction actionWithTitle:@"改备注名" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *a) { AGPromptRename(card); }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"删除这张卡" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *a) {
+        __weak UITableView *tv = self.tv;
+        AGConfirmDelete(card, ^(BOOL ok) {
+            [tv reloadData];
+            AGCollapseDeletedRows();
+        });
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [top presentViewController:ac animated:YES completion:nil];
+}
+
+@end
+
 static const void *kAGProxyKey = &kAGProxyKey;
+static const void *kAGGestureKeyRow = &kAGGestureKeyRow;
+static const void *kAGRowMenuKey = &kAGRowMenuKey;
 
 static UITableView *AGFindTableView(UIView *v) {
     if ([v isKindOfClass:[UITableView class]]) {
@@ -735,14 +940,41 @@ static UITableView *AGFindTableView(UIView *v) {
 static void AGInstallTableProxy(UIViewController *vc) {
     if (!AGIsTagListController(vc)) return;
     UITableView *tv = AGFindTableView(vc.view);
-    if (!tv || !tv.delegate) return;
+    if (!tv) return;
+
+    // 长按后备入口：和 delegate 代理无关，先挂上
+    if (!objc_getAssociatedObject(tv, kAGGestureKeyRow)) {
+        objc_setAssociatedObject(tv, kAGGestureKeyRow, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        AGRowMenu *m = [[AGRowMenu alloc] init];
+        m.tv = tv;
+        UILongPressGestureRecognizer *lp =
+            [[UILongPressGestureRecognizer alloc] initWithTarget:m action:@selector(handle:)];
+        lp.minimumPressDuration = 0.5;
+        lp.cancelsTouchesInView = NO;
+        [tv addGestureRecognizer:lp];
+        // 手势的 target 是弱引用，得自己保活
+        objc_setAssociatedObject(tv, kAGRowMenuKey, m, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NSLog(@"[AemuloRename] row long-press attached");
+    }
+
+    if (!tv.delegate) return;
     if ([tv.delegate isKindOfClass:[AGTableProxy class]]) return;
+
+    SEL swipe = @selector(tableView:trailingSwipeActionsConfigurationForRowAtIndexPath:);
+    BOOL origImplements = [tv.delegate respondsToSelector:swipe];
 
     AGTableProxy *p = [[AGTableProxy alloc] init];
     p.orig = tv.delegate;
     objc_setAssociatedObject(tv, kAGProxyKey, p, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     tv.delegate = p;
-    NSLog(@"[AemuloRename] table proxy installed on %@", NSStringFromClass([tv class]));
+    NSLog(@"[AemuloRename] table proxy installed on %@ (orig swipe=%d)",
+          NSStringFromClass([tv class]), (int)origImplements);
+}
+
+// 有些界面 table 是异步建/后设 delegate 的，隔一会儿再补一次
+static void AGInstallProxySoon(UIViewController *vc) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ AGInstallTableProxy(vc); });
 }
 
 #pragma mark - 列表页
@@ -750,6 +982,7 @@ static void AGInstallTableProxy(UIViewController *vc) {
 @interface AGCardListVC : UITableViewController
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *cards;
 @property (nonatomic, copy) NSString *dbPath;
+@property (nonatomic, copy) NSString *loadErr;
 - (void)done;
 - (void)reload;
 - (void)exportDB;
@@ -786,7 +1019,20 @@ static void AGInstallTableProxy(UIViewController *vc) {
 }
 
 - (void)reload {
-    self.cards = [AGLoadCards(self.dbPath) mutableCopy];
+    self.dbPath = AGDatabasePath();
+    NSString *err = nil;
+    NSArray *a = AGLoadCardsErr(self.dbPath, &err);
+    if (a.count == 0 && err.length) {
+        // 让"没有卡"和"读不到"区分开：读不到就换路径再试一次
+        AGInvalidateDatabasePath();
+        NSString *p2 = AGDatabasePath();
+        if (p2.length && ![p2 isEqualToString:self.dbPath]) {
+            self.dbPath = p2;
+            a = AGLoadCardsErr(p2, &err);
+        }
+    }
+    self.loadErr = a.count ? nil : err;
+    self.cards = [a mutableCopy];
     [self.tableView reloadData];
     [self.refreshControl endRefreshing];
 }
@@ -796,9 +1042,17 @@ static void AGInstallTableProxy(UIViewController *vc) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (!self.dbPath) return @"找不到 TagDatabase.sqlite3，改名不可用。";
-    if (!self.cards.count) return @"这张库里还没有卡片。";
-    return @"点一行改名，左滑删除，右上角导出库。主页列表会立刻显示新名字；若某行还是 UID，下拉主页刷新或重开 App。";
+    if (!self.dbPath) return @"找不到 TagDatabase.sqlite3。";
+    if (self.cards.count) {
+        return [NSString stringWithFormat:
+                @"%lu 张卡 · 点一行改名，左滑删除，右上角导出。",
+                (unsigned long)self.cards.count];
+    }
+    if (self.loadErr.length) {
+        return [NSString stringWithFormat:@"读库失败：%@\n下拉可重试。\n%@",
+                self.loadErr, self.dbPath.lastPathComponent];
+    }
+    return [NSString stringWithFormat:@"这库里 0 行。\n%@", self.dbPath];
 }
 
 - (void)toast:(NSString *)title message:(NSString *)message {
@@ -995,13 +1249,16 @@ static BOOL AGIsTagListController(UIViewController *vc) {
 static void AGInstallEntry(UIViewController *vc) {
     if (!AGIsTagListController(vc)) return;
 
+    // 必须在下面那个 return 之前：按钮已经有"改名"时以前会直接返回，
+    // 结果表格代理永远装不上（第一帧 delegate 还没设上就再也不重试了）。
+    AGInstallTableProxy(vc);
+    AGInstallProxySoon(vc);
+
     // 每次出现都检查一遍：App 自己可能在 viewWillAppear 里重设 rightBarButtonItems
     NSArray *existing = vc.navigationItem.rightBarButtonItems ?: @[];
     for (UIBarButtonItem *i in existing) {
         if ([i.title isEqualToString:@"改名"]) return;
     }
-
-    AGInstallTableProxy(vc);
 
     UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:@"改名"
                                                              style:UIBarButtonItemStylePlain
