@@ -14,6 +14,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <sqlite3.h>
+#include <string.h>
 
 // 版本标记：CI 用它做硬断言，认版本别认文件大小
 static NSString *const kAGVer = @"AG_VER_V1";
@@ -124,7 +125,24 @@ static BOOL AGRenameCard(NSString *dbPath, NSString *table, NSString *uuid, NSSt
         sqlite3_bind_text(st, 1, newName.UTF8String, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, uuid.UTF8String, -1, SQLITE_TRANSIENT);
         int rc = sqlite3_step(st);
-        ok = (rc == SQLITE_DONE) && (sqlite3_changes(db) > 0);
+        ok = (rc == SQLITE_DONE);
+        // changes==0 可能是"新名字和旧名字一样"，回查一次再定成败
+        if (ok && sqlite3_changes(db) == 0) {
+            sqlite3_stmt *chk = NULL;
+            NSString *q = [NSString stringWithFormat:@"SELECT name FROM \"%@\" WHERE uuid = ?1", table];
+            if (sqlite3_prepare_v2(db, q.UTF8String, -1, &chk, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(chk, 1, uuid.UTF8String, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(chk) == SQLITE_ROW) {
+                    const char *cur = (const char *)sqlite3_column_text(chk, 0);
+                    ok = cur && strcmp(cur, newName.UTF8String) == 0;
+                } else {
+                    ok = NO;
+                }
+                sqlite3_finalize(chk);
+            } else {
+                ok = NO;
+            }
+        }
         if (!ok) NSLog(@"[AemuloRename] update rc=%d changes=%d err=%s",
                        rc, sqlite3_changes(db), sqlite3_errmsg(db));
         sqlite3_finalize(st);
@@ -358,9 +376,37 @@ static void AGViewDidAppear(id self, SEL _cmd, BOOL animated) {
     if ([self isKindOfClass:[UIViewController class]]) AGInstallEntry((UIViewController *)self);
 }
 
+// 双指长按：窗口级兜底入口。不依赖 Swift 侧是否调用了 super，构造期就挂上。
+static void AGAttachWindowGesture(void) {
+    UIWindow *key = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w.isKeyWindow) { key = w; break; }
+    }
+    if (!key && UIApplication.sharedApplication.windows.count)
+        key = UIApplication.sharedApplication.windows.firstObject;
+    if (!key || objc_getAssociatedObject(key, kAGGestureKey)) return;
+
+    objc_setAssociatedObject(key, kAGGestureKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:[AGRenamEntry shared]
+                                                      action:@selector(handleLongPress:)];
+    lp.numberOfTouchesRequired = 2;
+    lp.minimumPressDuration = 0.8;
+    lp.cancelsTouchesInView = NO;
+    [key addGestureRecognizer:lp];
+    NSLog(@"[AemuloRename] window gesture attached");
+}
+
 __attribute__((constructor))
 static void AGInit(void) {
     NSLog(@"[AemuloRename] loaded · %@ · substrate-free", kAGVer);
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                      object:nil queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *n) { AGAttachWindowGesture(); }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *n) { AGAttachWindowGesture(); }];
 
     Method m1 = class_getInstanceMethod([UIViewController class], @selector(viewDidLoad));
     if (m1) {
