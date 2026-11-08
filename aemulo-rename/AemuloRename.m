@@ -17,7 +17,7 @@
 #include <string.h>
 
 // 版本标记：CI 用它做硬断言，认版本别认文件大小
-static NSString *const kAGVer = @"AG_VER_V4";
+static NSString *const kAGVer = @"AG_VER_V5";
 
 static NSString *const kAGGroupID = @"group.amywhile.aemulo";
 static NSString *const kAGDBName = @"TagDatabase.sqlite3";
@@ -327,11 +327,12 @@ static NSString *AGTranslate(NSString *s) {
 
 // —— UIView 文本入口全部过一遍词典 ——
 static void (*AGOrigSetText)(id, SEL, NSString *);
-static BOOL AGIsTagCell(UIView *v);
 static NSString *AGNameForUIDText(NSString *s);
 static void AGSetText(id self, SEL _cmd, NSString *text) {
     NSString *out = AGTranslate(text);
-    if (out == text && [self isKindOfClass:[UILabel class]] && AGIsTagCell((UIView *)self)) {
+    // 不限定 cell 类型：主页 cell 的类名不一定叫 TagCell，
+    // 只要文本整体就是一个 UID 且库里有对应备注名，就换成备注名。
+    if (out == text && [self isKindOfClass:[UILabel class]]) {
         NSString *n = AGNameForUIDText(text);
         if (n.length) out = n;
     }
@@ -474,15 +475,6 @@ static NSString *AGNameForUIDText(NSString *s) {
     return hit;
 }
 
-// 只认 TagCell（主页列表），不碰 TagInfoValueCell —— 详情页的 UID 行要保持原样
-static BOOL AGIsTagCell(UIView *v) {
-    for (UIView *p = v; p; p = p.superview) {
-        if ([p isKindOfClass:[UITableViewCell class]])
-            return [NSStringFromClass([p class]) containsString:@"TagCell"];
-    }
-    return NO;
-}
-
 static void AGFixLabelsIn(UIView *v) {
     if ([v isKindOfClass:[UILabel class]]) {
         UILabel *l = (UILabel *)v;
@@ -500,7 +492,8 @@ static void AGFixLabelsIn(UIView *v) {
 static void (*AGOrigCellLayout)(id, SEL);
 static void AGCellLayout(id self, SEL _cmd) {
     AGOrigCellLayout(self, _cmd);
-    if (![NSStringFromClass([self class]) containsString:@"TagCell"]) return;
+    // 任意 cell 都扫，不只 TagCell：逐个 label 只做一次前缀判断，开销可以忽略
+    if (![self isKindOfClass:[UITableViewCell class]]) return;
     if (!AGNameMap) AGRebuildNameMap();
     if (!AGNameMap.count) return;
     AGFixLabelsIn((UIView *)self);
