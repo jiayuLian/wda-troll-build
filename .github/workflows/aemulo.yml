@@ -7,71 +7,65 @@ on:
       - 'aemulo-rename/**'
       - '.github/workflows/aemulo.yml'
 
-defaults:
-  run:
-    working-directory: aemulo-rename
-
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain
+      - name: Toolchain
         run: |
-          brew install ldid xz make || true
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld xz-utils file
+          clang --version | head -2
+          which ld64.lld ld.lld || true
+          ls /usr/lib/llvm-*/bin/ | grep -i 'ld64' || true
 
-      - name: Setup Theos
+      - name: iOS SDK (sparse checkout)
         run: |
-          export THEOS="$RUNNER_TEMP/theos"
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-          echo "$THEOS/bin" >> "$GITHUB_PATH"
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git sdksrc
+          cd sdksrc && git sparse-checkout set iPhoneOS16.5.sdk
+          du -sh iPhoneOS16.5.sdk
+          ls iPhoneOS16.5.sdk
 
-      - name: Build
+      - name: Build dylib
+        working-directory: aemulo-rename
         run: |
-          make clean || true
-          make FINALPACKAGE=1 ARCHS="arm64" 2>&1 | tail -80
+          set -x
+          SDK="$GITHUB_WORKSPACE/sdksrc/iPhoneOS16.5.sdk"
+          mkdir -p out
+          clang -target arm64-apple-ios14.0 \
+            -isysroot "$SDK" \
+            -dynamiclib -fobjc-arc -O2 -fuse-ld=lld \
+            -Wl,-platform_version,ios,14.0,16.5 \
+            -Wl,-install_name,@executable_path/Frameworks/AemuloRename.dylib \
+            -framework UIKit -framework Foundation -lsqlite3 -lobjc \
+            -o out/AemuloRename.dylib AemuloRename.m
+          file out/AemuloRename.dylib
+          ls -la out/
 
-      - name: Collect and verify
+      - name: Verify
+        working-directory: aemulo-rename
         run: |
           set -e
-          mkdir -p out
-          BIN=""
-          for c in ".theos/obj/iphoneos.arm64/AemuloRename.dylib" \
-                   ".theos/obj/AemuloRename.dylib" \
-                   ".theos/obj/debug/AemuloRename.dylib"; do
-            if [ -f "$c" ]; then BIN="$c"; break; fi
-          done
-          if [ -z "$BIN" ]; then
-            BIN=$(find .theos -name '*.dSYM' -prune -o -type f -name 'AemuloRename.dylib' -print | head -1)
+          python3 - <<'PY'
+          import struct,sys
+          p='out/AemuloRename.dylib'
+          d=open(p,'rb').read()
+          magic=struct.unpack('<I',d[:4])[0]
+          cpu=struct.unpack('<i',d[4:8])[0]
+          ft=struct.unpack('<I',d[12:16])[0]
+          print('magic=%#x cpu=%#x filetype=%d size=%d'%(magic,cpu,ft,len(d)))
+          assert magic==0xfeedfacf, 'not Mach-O 64'
+          assert cpu==0x100000c, 'not arm64'
+          assert ft==6, 'not MH_DYLIB'
+          assert b'AG_VER_V1' in d, 'version marker missing'
+          print('OK')
+          PY
+          if strings out/AemuloRename.dylib | grep -qi 'substrate\|ellekit'; then
+            echo "FATAL: substrate referenced"; exit 1
           fi
-          echo "PICKED: $BIN"
-          test -n "$BIN"
-          cp "$BIN" out/AemuloRename.dylib
-
-          otool -hv out/AemuloRename.dylib
-          FT=$(otool -hv out/AemuloRename.dylib | tail -1 | awk '{print $5}')
-          echo "filetype = $FT"
-          if [ "$FT" != "DYLIB" ]; then echo "FATAL: not MH_DYLIB ($FT)"; exit 1; fi
-          lipo -info out/AemuloRename.dylib
-
-          echo "=== deps ==="
-          otool -L out/AemuloRename.dylib
-          if otool -L out/AemuloRename.dylib | grep -Eqi 'substrate|ellekit'; then
-            echo "FATAL: links hooking runtime"; exit 1
-          fi
-          if nm -u out/AemuloRename.dylib | grep -Eq '_MSHook|_HBLog'; then
-            echo "FATAL: substrate symbols"; exit 1
-          fi
-
-          if ! grep -aq "AG_VER_V1" out/AemuloRename.dylib; then
-            echo "FATAL: version marker missing"; exit 1
-          fi
-          echo "OK: AG_VER_V1"
-
-          ldid -S out/AemuloRename.dylib
-          ls -la out/
+          strings out/AemuloRename.dylib | grep -c 'AemuloRename' || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
