@@ -509,8 +509,10 @@ static void AGCellLayout(id self, SEL _cmd) {
 static void AGReloadTablesIn(UIView *v) {
     if ([v isKindOfClass:[UITableView class]]) {
         UITableView *tv = (UITableView *)v;
-        // 自己的卡片管理页不在这里刷，免得正在弹窗时被 reload 打断
-        if (![tv.dataSource isKindOfClass:[AGCardListVC class]]) [tv reloadData];
+        // 自己的卡片管理页不在这里刷，免得正在弹窗时被 reload 打断。
+        // 用 objc_getClass 取类对象：这时候 AGCardListVC 还只是前置声明
+        Class listCls = objc_getClass("AGCardListVC");
+        if (!listCls || ![tv.dataSource isKindOfClass:listCls]) [tv reloadData];
         return;
     }
     for (UIView *s in v.subviews) AGReloadTablesIn(s);
