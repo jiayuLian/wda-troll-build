@@ -17,7 +17,7 @@
 #include <string.h>
 
 // 版本标记：CI 用它做硬断言，认版本别认文件大小
-static NSString *const kAGVer = @"AG_VER_V1";
+static NSString *const kAGVer = @"AG_VER_V2";
 
 static NSString *const kAGGroupID = @"group.amywhile.aemulo";
 static NSString *const kAGDBName = @"TagDatabase.sqlite3";
@@ -153,18 +153,94 @@ static BOOL AGRenameCard(NSString *dbPath, NSString *table, NSString *uuid, NSSt
     return ok;
 }
 
+// 删除一张卡：只删这一行，其它字段不动
+static BOOL AGDeleteCard(NSString *dbPath, NSString *table, NSString *uuid) {
+    if (!dbPath.length || !table.length || !uuid.length) return NO;
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(dbPath.fileSystemRepresentation, &db,
+                        SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) {
+        NSLog(@"[AemuloRename] delete open failed: %s", sqlite3_errmsg(db));
+        if (db) sqlite3_close(db);
+        return NO;
+    }
+    sqlite3_busy_timeout(db, 5000);
+
+    NSString *sql = [NSString stringWithFormat:@"DELETE FROM \"%@\" WHERE uuid = ?1", table];
+    sqlite3_stmt *st = NULL;
+    BOOL ok = NO;
+    if (sqlite3_prepare_v2(db, sql.UTF8String, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, uuid.UTF8String, -1, SQLITE_TRANSIENT);
+        ok = (sqlite3_step(st) == SQLITE_DONE) && (sqlite3_changes(db) > 0);
+        if (!ok) NSLog(@"[AemuloRename] delete failed changes=%d err=%s",
+                       sqlite3_changes(db), sqlite3_errmsg(db));
+        sqlite3_finalize(st);
+    } else {
+        NSLog(@"[AemuloRename] delete prepare failed: %s", sqlite3_errmsg(db));
+    }
+    sqlite3_close(db);
+    return ok;
+}
+
+// 导出库：走 SQLite 在线备份接口，App 正在写也能拿到一致的快照
+static NSString *AGExportDatabase(NSString *dbPath) {
+    if (!dbPath.length) return nil;
+
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *name = [NSString stringWithFormat:@"TagDatabase-%@.sqlite3",
+                      [df stringFromDate:[NSDate date]]];
+    NSString *dst = [NSTemporaryDirectory() stringByAppendingPathComponent:name];
+    [[NSFileManager defaultManager] removeItemAtPath:dst error:NULL];
+
+    sqlite3 *from = NULL;
+    if (sqlite3_open_v2(dbPath.fileSystemRepresentation, &from,
+                        SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        NSLog(@"[AemuloRename] export open failed: %s", sqlite3_errmsg(from));
+        if (from) sqlite3_close(from);
+        return nil;
+    }
+    sqlite3_busy_timeout(from, 5000);
+
+    BOOL ok = NO;
+    sqlite3 *to = NULL;
+    if (sqlite3_open_v2(dst.fileSystemRepresentation, &to,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) == SQLITE_OK) {
+        sqlite3_backup *bk = sqlite3_backup_init(to, "main", from, "main");
+        if (bk) {
+            int rc = sqlite3_backup_step(bk, -1);
+            sqlite3_backup_finish(bk);
+            ok = (rc == SQLITE_DONE);
+        }
+        sqlite3_close(to);
+    }
+    sqlite3_close(from);
+
+    if (!ok) {
+        NSLog(@"[AemuloRename] export failed");
+        [[NSFileManager defaultManager] removeItemAtPath:dst error:NULL];
+        return nil;
+    }
+    NSLog(@"[AemuloRename] exported %@", dst);
+    return dst;
+}
+
 #pragma mark - 列表页
 
 @interface AGCardListVC : UITableViewController
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *cards;
 @property (nonatomic, copy) NSString *dbPath;
+- (void)done;
+- (void)reload;
+- (void)exportDB;
+- (void)toast:(NSString *)title message:(NSString *)message;
 @end
 
 @implementation AGCardListVC
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"卡片改名";
+    self.title = @"卡片管理";
     self.dbPath = AGDatabasePath();
     self.cards = [NSMutableArray array];
 
@@ -172,10 +248,14 @@ static BOOL AGRenameCard(NSString *dbPath, NSString *table, NSString *uuid, NSSt
     [rc addTarget:self action:@selector(reload) forControlEvents:UIControlEventValueChanged];
     self.refreshControl = rc;
 
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
-                                                      target:self
-                                                      action:@selector(done)];
+    UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                                          target:self
+                                                                          action:@selector(done)];
+    UIBarButtonItem *exportItem = [[UIBarButtonItem alloc] initWithTitle:@"导出"
+                                                                   style:UIBarButtonItemStylePlain
+                                                                  target:self
+                                                                  action:@selector(exportDB)];
+    self.navigationItem.rightBarButtonItems = @[done, exportItem];
     [self reload];
 }
 
@@ -197,7 +277,59 @@ static BOOL AGRenameCard(NSString *dbPath, NSString *table, NSString *uuid, NSSt
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (!self.dbPath) return @"找不到 TagDatabase.sqlite3，改名不可用。";
     if (!self.cards.count) return @"这张库里还没有卡片。";
-    return @"点一行改名，立即写入数据库。Aemulo 列表若没刷新，重启 App 生效。";
+    return @"点一行改名，左滑删除，右上角导出库。改动立即写入数据库；Aemulo 列表若没刷新，重启 App 生效。";
+}
+
+- (void)toast:(NSString *)title message:(NSString *)message {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                                 message:message
+                                                          preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)exportDB {
+    NSString *path = AGExportDatabase(self.dbPath);
+    if (!path) {
+        [self toast:@"导出失败" message:@"找不到数据库，或它正被占用。"];
+        return;
+    }
+    UIActivityViewController *av =
+        [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+                                           applicationActivities:nil];
+    av.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItems.firstObject;
+    [self presentViewController:av animated:YES completion:nil];
+}
+
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+    trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSDictionary *c = self.cards[indexPath.row];
+    __weak typeof(self) weakSelf = self;
+    UIContextualAction *del =
+        [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
+                                                title:@"删除"
+                                              handler:^(UIContextualAction *action, UIView *src,
+                                                        void (^completion)(BOOL)) {
+        UIAlertController *ac =
+            [UIAlertController alertControllerWithTitle:@"删除这张卡？"
+                                                message:[NSString stringWithFormat:@"%@\n%@",
+                                                         c[@"name"], c[@"uuid"]]
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                                            handler:^(UIAlertAction *a) { completion(NO); }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a) {
+            BOOL ok = AGDeleteCard(weakSelf.dbPath, c[@"table"], c[@"uuid"]);
+            if (ok) {
+                [weakSelf reload];
+            } else {
+                [weakSelf toast:@"删除失败" message:@"数据库可能被占用，下拉刷新后重试。"];
+            }
+            completion(ok);
+        }]];
+        [weakSelf presentViewController:ac animated:YES completion:nil];
+    }];
+    return [UISwipeActionsConfiguration configurationWithActions:@[del]];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
