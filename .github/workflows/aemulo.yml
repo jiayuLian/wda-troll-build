@@ -1,0 +1,80 @@
+name: aemulo-rename
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'aemulo-rename/**'
+      - '.github/workflows/aemulo.yml'
+
+defaults:
+  run:
+    working-directory: aemulo-rename
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          brew install ldid xz make || true
+
+      - name: Setup Theos
+        run: |
+          export THEOS="$RUNNER_TEMP/theos"
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          make clean || true
+          make FINALPACKAGE=1 ARCHS="arm64" 2>&1 | tail -80
+
+      - name: Collect and verify
+        run: |
+          set -e
+          mkdir -p out
+          BIN=""
+          for c in ".theos/obj/iphoneos.arm64/AemuloRename.dylib" \
+                   ".theos/obj/AemuloRename.dylib" \
+                   ".theos/obj/debug/AemuloRename.dylib"; do
+            if [ -f "$c" ]; then BIN="$c"; break; fi
+          done
+          if [ -z "$BIN" ]; then
+            BIN=$(find .theos -name '*.dSYM' -prune -o -type f -name 'AemuloRename.dylib' -print | head -1)
+          fi
+          echo "PICKED: $BIN"
+          test -n "$BIN"
+          cp "$BIN" out/AemuloRename.dylib
+
+          otool -hv out/AemuloRename.dylib
+          FT=$(otool -hv out/AemuloRename.dylib | tail -1 | awk '{print $5}')
+          echo "filetype = $FT"
+          if [ "$FT" != "DYLIB" ]; then echo "FATAL: not MH_DYLIB ($FT)"; exit 1; fi
+          lipo -info out/AemuloRename.dylib
+
+          echo "=== deps ==="
+          otool -L out/AemuloRename.dylib
+          if otool -L out/AemuloRename.dylib | grep -Eqi 'substrate|ellekit'; then
+            echo "FATAL: links hooking runtime"; exit 1
+          fi
+          if nm -u out/AemuloRename.dylib | grep -Eq '_MSHook|_HBLog'; then
+            echo "FATAL: substrate symbols"; exit 1
+          fi
+
+          if ! grep -aq "AG_VER_V1" out/AemuloRename.dylib; then
+            echo "FATAL: version marker missing"; exit 1
+          fi
+          echo "OK: AG_VER_V1"
+
+          ldid -S out/AemuloRename.dylib
+          ls -la out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AemuloRename
+          path: aemulo-rename/out/AemuloRename.dylib
