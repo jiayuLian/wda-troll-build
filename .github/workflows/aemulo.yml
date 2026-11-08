@@ -39,7 +39,8 @@ jobs:
             -dynamiclib -fobjc-arc -O2 -fuse-ld=lld \
             -Wl,-platform_version,ios,14.0,16.5 \
             -Wl,-install_name,@executable_path/Frameworks/AemuloRename.dylib \
-            -framework UIKit -framework Foundation -lsqlite3 -lobjc \
+            -framework UIKit -framework Foundation -framework CoreGraphics \
+            -lsqlite3 -lobjc \
             -o out/AemuloRename.dylib AemuloRename.m
           file out/AemuloRename.dylib
           ls -la out/
