@@ -17,7 +17,7 @@
 #include <string.h>
 
 // 版本标记：CI 用它做硬断言，认版本别认文件大小
-static NSString *const kAGVer = @"AG_VER_V3";
+static NSString *const kAGVer = @"AG_VER_V4";
 
 static NSString *const kAGGroupID = @"group.amywhile.aemulo";
 static NSString *const kAGDBName = @"TagDatabase.sqlite3";
@@ -327,8 +327,15 @@ static NSString *AGTranslate(NSString *s) {
 
 // —— UIView 文本入口全部过一遍词典 ——
 static void (*AGOrigSetText)(id, SEL, NSString *);
+static BOOL AGIsTagCell(UIView *v);
+static NSString *AGNameForUIDText(NSString *s);
 static void AGSetText(id self, SEL _cmd, NSString *text) {
-    AGOrigSetText(self, _cmd, AGTranslate(text));
+    NSString *out = AGTranslate(text);
+    if (out == text && [self isKindOfClass:[UILabel class]] && AGIsTagCell((UIView *)self)) {
+        NSString *n = AGNameForUIDText(text);
+        if (n.length) out = n;
+    }
+    AGOrigSetText(self, _cmd, out);
 }
 
 static void (*AGOrigSetAttrText)(id, SEL, NSAttributedString *);
@@ -406,6 +413,114 @@ static void __attribute__((unused)) AGSwizzleTextSetters(void) {
     }
 }
 
+#pragma mark - 主页列表显示备注名
+
+@class AGCardListVC;
+
+// 主页每行的标题是 UID（源码里由 String 插值拼成 "0x"+hex，二进制里抓不到格式串），
+// name 只在 Tag Info 页出现。所以只能在文本落到 UILabel 的那一刻把它换成备注名。
+// 映射表直接从库里现取，不依赖 Aemulo 自己的内存缓存。
+static NSMutableDictionary<NSString *, NSString *> *AGNameMap = nil;
+static NSTimeInterval AGNameMapAt = 0;
+
+static BOOL AGIsUIDText(NSString *s) {
+    if (s.length < 5 || s.length > 21) return NO;
+    if (![s hasPrefix:@"0x"] && ![s hasPrefix:@"0X"]) return NO;
+    static NSCharacterSet *hex = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        hex = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdefABCDEF"];
+    });
+    for (NSUInteger i = 2; i < s.length; i++) {
+        if (![hex characterIsMember:[s characterAtIndex:i]]) return NO;
+    }
+    return YES;
+}
+
+// "0xc30ac319" 和 "0xC30AC319" 要落到同一个键上
+static NSString *AGUIDKey(NSString *s) {
+    return [@"0x" stringByAppendingString:[[s substringFromIndex:2] uppercaseString]];
+}
+
+static void AGRebuildNameMap(void) {
+    NSMutableDictionary *m = [NSMutableDictionary dictionary];
+    for (NSDictionary *c in AGLoadCards(AGDatabasePath())) {
+        NSString *uid = c[@"uid"];      // SQLite hex()，大写无前缀
+        NSString *name = c[@"name"];
+        if (!uid.length || !name.length) continue;
+        m[[@"0x" stringByAppendingString:[uid uppercaseString]]] = name;
+        // 4 字节 UID 有的地方会补零到 8 位，两种写法都登记
+        if (uid.length < 8) {
+            NSString *pad = [uid uppercaseString];
+            while (pad.length < 8) pad = [@"0" stringByAppendingString:pad];
+            m[[@"0x" stringByAppendingString:pad]] = name;
+        }
+    }
+    AGNameMap = m;
+    AGNameMapAt = [NSDate date].timeIntervalSince1970;
+}
+
+static NSString *AGNameForUIDText(NSString *s) {
+    if (!AGIsUIDText(s)) return nil;
+    if (!AGNameMap) AGRebuildNameMap();
+    NSString *hit = AGNameMap[AGUIDKey(s)];
+    if (hit) return hit;
+    // 没命中可能刚改完名 / 刚加了卡：5 秒节流重建一次
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (now - AGNameMapAt > 5) {
+        AGRebuildNameMap();
+        hit = AGNameMap[AGUIDKey(s)];
+    }
+    return hit;
+}
+
+// 只认 TagCell（主页列表），不碰 TagInfoValueCell —— 详情页的 UID 行要保持原样
+static BOOL AGIsTagCell(UIView *v) {
+    for (UIView *p = v; p; p = p.superview) {
+        if ([p isKindOfClass:[UITableViewCell class]])
+            return [NSStringFromClass([p class]) containsString:@"TagCell"];
+    }
+    return NO;
+}
+
+static void AGFixLabelsIn(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        if (AGIsUIDText(l.text)) {
+            NSString *n = AGNameForUIDText(l.text);
+            if (n.length && AGOrigSetText) AGOrigSetText(l, @selector(setText:), n);
+        }
+        return;
+    }
+    for (UIView *s in v.subviews) AGFixLabelsIn(s);
+}
+
+// 兜底：文本可能在加入 cell 之前就设好了，那时 superview 链上还没有 cell。
+// 每次 cell 布局完再扫一遍，成本只有几个 label。
+static void (*AGOrigCellLayout)(id, SEL);
+static void AGCellLayout(id self, SEL _cmd) {
+    AGOrigCellLayout(self, _cmd);
+    if (![NSStringFromClass([self class]) containsString:@"TagCell"]) return;
+    if (!AGNameMap) AGRebuildNameMap();
+    if (!AGNameMap.count) return;
+    AGFixLabelsIn((UIView *)self);
+}
+
+static void AGReloadTablesIn(UIView *v) {
+    if ([v isKindOfClass:[UITableView class]]) {
+        UITableView *tv = (UITableView *)v;
+        // 自己的卡片管理页不在这里刷，免得正在弹窗时被 reload 打断
+        if (![tv.dataSource isKindOfClass:[AGCardListVC class]]) [tv reloadData];
+        return;
+    }
+    for (UIView *s in v.subviews) AGReloadTablesIn(s);
+}
+
+static void AGRefreshOtherTables(void) {
+    AGRebuildNameMap();
+    for (UIWindow *w in UIApplication.sharedApplication.windows) AGReloadTablesIn(w);
+}
+
 #pragma mark - 列表页
 
 @interface AGCardListVC : UITableViewController
@@ -441,6 +556,7 @@ static void __attribute__((unused)) AGSwizzleTextSetters(void) {
 }
 
 - (void)done {
+    AGRefreshOtherTables();
     if (self.navigationController) [self.navigationController popViewControllerAnimated:YES];
     else [self dismissViewControllerAnimated:YES completion:nil];
 }
@@ -458,7 +574,7 @@ static void __attribute__((unused)) AGSwizzleTextSetters(void) {
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (!self.dbPath) return @"找不到 TagDatabase.sqlite3，改名不可用。";
     if (!self.cards.count) return @"这张库里还没有卡片。";
-    return @"点一行改名，左滑删除，右上角导出库。改动立即写入数据库；Aemulo 列表若没刷新，重启 App 生效。";
+    return @"点一行改名，左滑删除，右上角导出库。主页列表会立刻显示新名字；若某行还是 UID，下拉主页刷新或重开 App。";
 }
 
 - (void)toast:(NSString *)title message:(NSString *)message {
@@ -503,6 +619,7 @@ static void __attribute__((unused)) AGSwizzleTextSetters(void) {
             BOOL ok = AGDeleteCard(weakSelf.dbPath, c[@"table"], c[@"uuid"]);
             if (ok) {
                 [weakSelf reload];
+                AGRefreshOtherTables();
             } else {
                 [weakSelf toast:@"删除失败" message:@"数据库可能被占用，下拉刷新后重试。"];
             }
@@ -573,6 +690,8 @@ static void __attribute__((unused)) AGSwizzleTextSetters(void) {
         [weakSelf.cards replaceObjectAtIndex:indexPath.row withObject:m];
         [weakSelf.tableView reloadRowsAtIndexPaths:@[indexPath]
                                   withRowAnimation:UITableViewRowAnimationFade];
+        // 主页列表的标题是 UID，改完名要重刷一遍才会走我们的替换
+        AGRefreshOtherTables();
     }]];
     [self presentViewController:ac animated:YES completion:nil];
 }
@@ -721,6 +840,12 @@ static void AGInit(void) {
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *n) { AGAttachWindowGesture(); }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *n) {
+        // 从后台回来时库可能被 Aemulo 改过（比如新拷了卡），重建映射
+        AGRebuildNameMap();
+    }];
 
     Method m1 = class_getInstanceMethod([UIViewController class], @selector(viewDidLoad));
     if (m1) {
@@ -731,5 +856,12 @@ static void AGInit(void) {
     if (m2) {
         AGOrigViewDidAppear = (void *)method_getImplementation(m2);
         method_setImplementation(m2, (IMP)AGViewDidAppear);
+    }
+
+    // 主页 cell 布局完再扫一遍 UID → 名字，兜住"先设文本后加 cell"的情况
+    Method m3 = class_getInstanceMethod([UITableViewCell class], @selector(layoutSubviews));
+    if (m3) {
+        AGOrigCellLayout = (void *)method_getImplementation(m3);
+        method_setImplementation(m3, (IMP)AGCellLayout);
     }
 }
