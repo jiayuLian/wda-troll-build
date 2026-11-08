@@ -1,0 +1,8 @@
+Package: com.jiayulian.aemulorename
+Name: AemuloRename
+Version: 1.0
+Architecture: iphoneos-arm
+Description: Rename Aemulo cards in-app
+Maintainer: jiayuLian
+Author: jiayuLian
+Section: Tweaks
