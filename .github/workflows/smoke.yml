@@ -1,0 +1,7 @@
+name: smoke
+on: workflow_dispatch
+jobs:
+  u:
+    runs-on: ubuntu-latest
+    steps:
+      - run: uname -a
